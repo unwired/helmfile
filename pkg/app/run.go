@@ -228,3 +228,9 @@ func (r *Run) diff(triggerCleanupEvent bool, detailedExitCode bool, c DiffConfig
 func (r *Run) GetState() *state.HelmState {
 	return r.state
 }
+
+// Hack to get access to helmfile’s API
+// -rluba, 2025-05-19
+func (r *Run) GetHelm() helmexec.Interface {
+	return r.helm
+}
