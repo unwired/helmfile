@@ -1614,42 +1614,54 @@ func (a *App) getSelectedReleases(r *Run, includeTransitiveNeeds bool) ([]state.
 	return selected, deduplicated, nil
 }
 
-func (a *App) apply(r *Run, c ApplyConfigProvider) (bool, bool, []error) {
-	st := r.state
-	helm := r.helm
-
-	helm.SetExtraArgs(GetArgs(c.Args(), r.state)...)
-
-	selectedReleases, selectedAndNeededReleases, err := a.getSelectedReleases(r, c.IncludeTransitiveNeeds())
+func (a *App) GetPlannedAndSelectedReleasesWithNeeds(r *Run, skipNeeds bool, includeNeeds bool, includeTransitiveNeeds bool) ([]state.ReleaseSpec, []state.ReleaseSpec, error) {
+	selectedReleases, selectedAndNeededReleases, err := a.getSelectedReleases(r, includeTransitiveNeeds)
 	if err != nil {
-		return false, false, []error{err}
+		return nil, nil, err
 	}
 	if len(selectedReleases) == 0 {
-		return false, false, nil
+		return nil, nil, nil
 	}
 
 	// This is required when you're trying to deduplicate releases by the selector.
 	// Without this, `PlanReleases` conflates duplicates and return both in `batches`,
 	// even if we provided `SelectedReleases: selectedReleases`.
 	// See https://github.com/roboll/helmfile/issues/1818 for more context.
-	st.Releases = selectedAndNeededReleases
+	r.state.Releases = selectedAndNeededReleases
 
-	plan, err := st.PlanReleases(state.PlanOptions{Reverse: false, SelectedReleases: selectedReleases, SkipNeeds: c.SkipNeeds(), IncludeNeeds: c.IncludeNeeds(), IncludeTransitiveNeeds: c.IncludeTransitiveNeeds()})
+	batches, err := r.state.PlanReleases(state.PlanOptions{Reverse: false, SelectedReleases: selectedReleases, SkipNeeds: skipNeeds, IncludeNeeds: includeNeeds, IncludeTransitiveNeeds: includeTransitiveNeeds})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var releasesWithNeeds []state.ReleaseSpec
+
+	for _, rs := range batches {
+		for _, r := range rs {
+			releasesWithNeeds = append(releasesWithNeeds, r.ReleaseSpec)
+		}
+	}
+
+	return releasesWithNeeds, selectedAndNeededReleases, nil
+}
+
+func (a *App) apply(r *Run, c ApplyConfigProvider) (bool, bool, []error) {
+	st := r.state
+	helm := r.helm
+
+	helm.SetExtraArgs(GetArgs(c.Args(), r.state)...)
+
+	releasesWithNeeds, selectedAndNeededReleases, err := a.GetPlannedAndSelectedReleasesWithNeeds(r, c.SkipNeeds(), c.IncludeNeeds(), c.IncludeTransitiveNeeds())
 	if err != nil {
 		return false, false, []error{err}
 	}
-
-	var toApplyWithNeeds []state.ReleaseSpec
-
-	for _, rs := range plan {
-		for _, r := range rs {
-			toApplyWithNeeds = append(toApplyWithNeeds, r.ReleaseSpec)
-		}
+	if len(releasesWithNeeds) == 0 {
+		return false, false, nil
 	}
 
 	// Do build deps and prepare only on selected releases so that we won't waste time
 	// on running various helm commands on unnecessary releases
-	st.Releases = toApplyWithNeeds
+	st.Releases = releasesWithNeeds
 
 	// helm must be 2.11+ and helm-diff should be provided `--detailed-exitcode` in order for `helmfile apply` to work properly
 	detailedExitCode := true
@@ -1691,7 +1703,7 @@ func (a *App) apply(r *Run, c ApplyConfigProvider) (bool, bool, []error) {
 	}
 
 	releasesWithNoChange := map[string]state.ReleaseSpec{}
-	for _, r := range toApplyWithNeeds {
+	for _, r := range releasesWithNeeds {
 		release := r
 		id := state.ReleaseToID(&release)
 		_, uninstalled := releasesToBeDeleted[id]
@@ -1729,7 +1741,7 @@ Do you really want to apply?
 	}
 
 	if !interactive || interactive && r.askForConfirmation(confMsg) {
-		if _, preapplyErrors := withDAG(st, helm, a.Logger, state.PlanOptions{Purpose: "invoking preapply hooks for", Reverse: true, SelectedReleases: toApplyWithNeeds, SkipNeeds: true}, a.WrapWithoutSelector(func(subst *state.HelmState, helm helmexec.Interface) []error {
+		if _, preapplyErrors := withDAG(st, helm, a.Logger, state.PlanOptions{Purpose: "invoking preapply hooks for", Reverse: true, SelectedReleases: releasesWithNeeds, SkipNeeds: true}, a.WrapWithoutSelector(func(subst *state.HelmState, helm helmexec.Interface) []error {
 			for _, r := range subst.Releases {
 				release := r
 				if _, err := st.TriggerPreapplyEvent(&release, "apply"); err != nil {
@@ -2099,38 +2111,19 @@ func (a *App) sync(r *Run, c SyncConfigProvider) (bool, []error) {
 	st := r.state
 	helm := r.helm
 
-	selectedReleases, selectedAndNeededReleases, err := a.getSelectedReleases(r, c.IncludeTransitiveNeeds())
+	releasesWithNeeds, selectedAndNeededReleases, err := a.GetPlannedAndSelectedReleasesWithNeeds(r, c.SkipNeeds(), c.IncludeNeeds(), c.IncludeTransitiveNeeds())
 	if err != nil {
 		return false, []error{err}
 	}
-	if len(selectedReleases) == 0 {
+	if len(releasesWithNeeds) == 0 {
 		return false, nil
-	}
-
-	// This is required when you're trying to deduplicate releases by the selector.
-	// Without this, `PlanReleases` conflates duplicates and return both in `batches`,
-	// even if we provided `SelectedReleases: selectedReleases`.
-	// See https://github.com/roboll/helmfile/issues/1818 for more context.
-	st.Releases = selectedAndNeededReleases
-
-	batches, err := st.PlanReleases(state.PlanOptions{Reverse: false, SelectedReleases: selectedReleases, IncludeNeeds: c.IncludeNeeds(), IncludeTransitiveNeeds: c.IncludeTransitiveNeeds(), SkipNeeds: c.SkipNeeds()})
-	if err != nil {
-		return false, []error{err}
-	}
-
-	var toSyncWithNeeds []state.ReleaseSpec
-
-	for _, rs := range batches {
-		for _, r := range rs {
-			toSyncWithNeeds = append(toSyncWithNeeds, r.ReleaseSpec)
-		}
 	}
 
 	// Do build deps and prepare only on selected releases so that we won't waste time
 	// on running various helm commands on unnecessary releases
-	st.Releases = toSyncWithNeeds
+	st.Releases = releasesWithNeeds
 
-	toDelete, err := st.DetectReleasesToBeDeletedForSync(helm, toSyncWithNeeds)
+	toDelete, err := st.DetectReleasesToBeDeletedForSync(helm, releasesWithNeeds)
 	if err != nil {
 		return false, []error{err}
 	}
@@ -2143,7 +2136,7 @@ func (a *App) sync(r *Run, c SyncConfigProvider) (bool, []error) {
 	}
 
 	var toUpdate []state.ReleaseSpec
-	for _, r := range toSyncWithNeeds {
+	for _, r := range releasesWithNeeds {
 		release := r
 		if _, deleted := releasesToDelete[state.ReleaseToID(&release)]; !deleted {
 			if r.Desired() {
@@ -2163,7 +2156,7 @@ func (a *App) sync(r *Run, c SyncConfigProvider) (bool, []error) {
 	}
 
 	releasesWithNoChange := map[string]state.ReleaseSpec{}
-	for _, r := range toSyncWithNeeds {
+	for _, r := range releasesWithNeeds {
 		release := r
 		id := state.ReleaseToID(&release)
 		_, uninstalled := releasesToDelete[id]
