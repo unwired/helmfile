@@ -14,6 +14,7 @@ type ConfigProvider interface {
 	SkipDeps() bool
 	SkipRefresh() bool
 	SequentialHelmfiles() bool
+	AllowPartialErrors() bool
 
 	FileOrDir() string
 	KubeContext() string
@@ -56,6 +57,7 @@ type ApplyConfigProvider interface {
 	SkipCRDs() bool
 	SkipDeps() bool
 	SkipRefresh() bool
+	AllowPartialErrors() bool
 	Wait() bool
 	WaitRetries() int
 	WaitForJobs() bool
@@ -115,6 +117,7 @@ type SyncConfigProvider interface {
 	SkipCRDs() bool
 	SkipDeps() bool
 	SkipRefresh() bool
+	AllowPartialErrors() bool
 	Wait() bool
 	WaitRetries() int
 	WaitForJobs() bool
@@ -156,6 +159,7 @@ type DiffConfigProvider interface {
 	SkipCRDs() bool
 	SkipDeps() bool
 	SkipRefresh() bool
+	AllowPartialErrors() bool
 
 	IncludeTests() bool
 
@@ -187,6 +191,7 @@ type DestroyConfigProvider interface {
 
 	SkipDeps() bool
 	SkipRefresh() bool
+	AllowPartialErrors() bool
 	SkipCharts() bool
 	DeleteWait() bool
 	DeleteTimeout() int
@@ -201,6 +206,7 @@ type TestConfigProvider interface {
 
 	SkipDeps() bool
 	SkipRefresh() bool
+	AllowPartialErrors() bool
 	Timeout() int
 	Cleanup() bool
 	Logs() bool
@@ -215,6 +221,7 @@ type LintConfigProvider interface {
 	Set() []string
 	SkipDeps() bool
 	SkipRefresh() bool
+	AllowPartialErrors() bool
 	SkipCleanup() bool
 
 	DAGConfig
@@ -232,6 +239,7 @@ type UnittestConfigProvider interface {
 	DebugPlugin() bool
 	SkipDeps() bool
 	SkipRefresh() bool
+	AllowPartialErrors() bool
 	SkipCleanup() bool
 
 	DAGConfig
@@ -242,6 +250,7 @@ type UnittestConfigProvider interface {
 type FetchConfigProvider interface {
 	SkipDeps() bool
 	SkipRefresh() bool
+	AllowPartialErrors() bool
 	OutputDir() string
 	OutputDirTemplate() string
 	WriteOutput() bool
@@ -261,6 +270,7 @@ type TemplateConfigProvider interface {
 	Validate() bool
 	SkipDeps() bool
 	SkipRefresh() bool
+	AllowPartialErrors() bool
 	SkipCleanup() bool
 	SkipTests() bool
 	OutputDir() string
@@ -287,6 +297,7 @@ type WriteValuesConfigProvider interface {
 	OutputFileTemplate() string
 	SkipDeps() bool
 	SkipRefresh() bool
+	AllowPartialErrors() bool
 	SkipCleanup() bool
 	IncludeTransitiveNeeds() bool
 
