@@ -1400,6 +1400,8 @@ type ChartPrepareOptions struct {
 	// SkipSchemaValidation configures chartify to pass --skip-schema-validation to helm-template run by it.
 	SkipSchemaValidation bool
 	// Validate configures chartify to pass --validate to helm-template run by it.
+	AllowPartialErrors bool
+	// Validate is a helm-3-only option. When it is set to true, it configures chartify to pass --validate to helm-template run by it.
 	// It's required when one of your chart relies on Capabilities.APIVersions in a template
 	Validate               bool
 	IncludeCRDs            *bool
@@ -2103,7 +2105,13 @@ func (st *HelmState) PrepareCharts(helm helmexec.Interface, dir string, concurre
 
 				if downloadRes.err != nil {
 					errs = append(errs, downloadRes.err)
-					return
+
+					if !opts.AllowPartialErrors {
+						return
+					} else {
+						// continue processing other releases even if one fails
+						continue
+					}
 				}
 				func() {
 					prepareChartInfoMutex.Lock()
@@ -2124,7 +2132,15 @@ func (st *HelmState) PrepareCharts(helm helmexec.Interface, dir string, concurre
 	)
 
 	if len(errs) > 0 {
-		return nil, errs
+		if !opts.AllowPartialErrors {
+			return nil, errs
+		} else {
+			// continue processing other releases even if one fails, return partial results with errors for the failed ones
+			st.logger.Warnf("Some charts failed to prepare:\n")
+			for _, err := range errs {
+				st.logger.Warnf(" - %v\n", err)
+			}
+		}
 	}
 
 	if len(builds) > 0 {
