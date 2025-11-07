@@ -26,6 +26,8 @@ const (
 	DefaultHCLFileExtension = ".hcl"
 )
 
+var ValidUpdateStrategyValues = []string{UpdateStrategyReinstallIfForbidden}
+
 type StateLoadError struct {
 	Msg   string
 	Cause error
@@ -43,6 +45,14 @@ func (e *UndefinedEnvError) Error() string {
 	return fmt.Sprintf("environment \"%s\" is not defined", e.Env)
 }
 
+type InvalidUpdateStrategyError struct {
+	UpdateStrategy string
+}
+
+func (e *InvalidUpdateStrategyError) Error() string {
+	return fmt.Sprintf("updateStrategy %q is invalid, valid values are: %s or not set", e.UpdateStrategy, strings.Join(ValidUpdateStrategyValues, ", "))
+}
+
 type StateCreator struct {
 	logger *zap.SugaredLogger
 
@@ -54,7 +64,7 @@ type StateCreator struct {
 
 	LoadFile func(inheritedEnv, overrodeEnv *environment.Environment, baseDir, file string, evaluateBases bool) (*HelmState, error)
 
-	getHelm func(*HelmState) helmexec.Interface
+	getHelm func(*HelmState) (helmexec.Interface, error)
 
 	overrideHelmBinary string
 
@@ -67,7 +77,7 @@ type StateCreator struct {
 	lockFile string
 }
 
-func NewCreator(logger *zap.SugaredLogger, fs *filesystem.FileSystem, valsRuntime vals.Evaluator, getHelm func(*HelmState) helmexec.Interface, overrideHelmBinary string, overrideKustomizeBinary string, remote *remote.Remote, enableLiveOutput bool, lockFile string) *StateCreator {
+func NewCreator(logger *zap.SugaredLogger, fs *filesystem.FileSystem, valsRuntime vals.Evaluator, getHelm func(*HelmState) (helmexec.Interface, error), overrideHelmBinary string, overrideKustomizeBinary string, remote *remote.Remote, enableLiveOutput bool, lockFile string) *StateCreator {
 	return &StateCreator{
 		logger: logger,
 
@@ -116,11 +126,19 @@ func (c *StateCreator) Parse(content []byte, baseDir, file string) (*HelmState, 
 			return nil, &StateLoadError{fmt.Sprintf("failed to read %s: reading document at index %d", file, i), err}
 		}
 
-		if err := mergo.Merge(&state, &intermediate, mergo.WithAppendSlice); err != nil {
+		if err := mergo.Merge(&state, &intermediate, mergo.WithAppendSlice, mergo.WithOverride); err != nil {
 			return nil, &StateLoadError{fmt.Sprintf("failed to read %s: merging document at index %d", file, i), err}
 		}
 	}
 
+	state.logger = c.logger
+	state.valsRuntime = c.valsRuntime
+
+	return &state, nil
+}
+
+// applyDefaultsAndOverrides applies default binary paths and command-line overrides
+func (c *StateCreator) applyDefaultsAndOverrides(state *HelmState) {
 	if c.overrideHelmBinary != "" && c.overrideHelmBinary != DefaultHelmBinary {
 		state.DefaultHelmBinary = c.overrideHelmBinary
 	} else if state.DefaultHelmBinary == "" {
@@ -134,11 +152,6 @@ func (c *StateCreator) Parse(content []byte, baseDir, file string) (*HelmState, 
 		// Let `helmfile --kustomize-binary ""` not break this helmfile run
 		state.DefaultKustomizeBinary = DefaultKustomizeBinary
 	}
-
-	state.logger = c.logger
-	state.valsRuntime = c.valsRuntime
-
-	return &state, nil
 }
 
 // LoadEnvValues loads environment values files relative to the `baseDir`
@@ -181,6 +194,11 @@ func (c *StateCreator) ParseAndLoad(content []byte, baseDir, file string, envNam
 		if err != nil {
 			return nil, err
 		}
+
+		// Apply default binaries and command-line overrides only for the main helmfile
+		// after loading and merging all bases. This ensures that values from bases are
+		// properly respected and that later bases/documents can override earlier ones.
+		c.applyDefaultsAndOverrides(state)
 	}
 
 	state, err = c.LoadEnvValues(state, envName, failOnMissingEnv, envValues, overrode)
@@ -216,12 +234,37 @@ func (c *StateCreator) loadBases(envValues, overrodeEnv *environment.Environment
 	layers = append(layers, st)
 
 	for i := 1; i < len(layers); i++ {
-		if err := mergo.Merge(layers[0], layers[i], mergo.WithAppendSlice); err != nil {
+		if err := mergo.Merge(layers[0], layers[i], mergo.WithAppendSlice, mergo.WithOverride); err != nil {
 			return nil, err
 		}
 	}
 
 	return layers[0], nil
+}
+
+// getEnvMissingFileHandlerConfig returns the first non-nil MissingFileHandlerConfig from the environment spec, state, or default.
+func (st *HelmState) getEnvMissingFileHandlerConfig(es EnvironmentSpec) *MissingFileHandlerConfig {
+	switch {
+	case es.MissingFileHandlerConfig != nil:
+		return es.MissingFileHandlerConfig
+	case st.MissingFileHandlerConfig != nil:
+		return st.MissingFileHandlerConfig
+	default:
+		return nil
+	}
+}
+
+// getEnvMissingFileHandler returns the first non-nil MissingFileHandler from the environment spec, state, or default.
+func (st *HelmState) getEnvMissingFileHandler(es EnvironmentSpec) *string {
+	defaultMissingFileHandler := "Error"
+	switch {
+	case es.MissingFileHandler != nil:
+		return es.MissingFileHandler
+	case st.MissingFileHandler != nil:
+		return st.MissingFileHandler
+	default:
+		return &defaultMissingFileHandler
+	}
 }
 
 // nolint: unparam
@@ -240,7 +283,7 @@ func (c *StateCreator) loadEnvValues(st *HelmState, name string, failOnMissingEn
 		var envSecretFiles []string
 		if len(envSpec.Secrets) > 0 {
 			for _, urlOrPath := range envSpec.Secrets {
-				resolved, skipped, err := st.storage().resolveFile(envSpec.MissingFileHandler, "environment values", urlOrPath, envSpec.MissingFileHandlerConfig.resolveFileOptions()...)
+				resolved, skipped, err := st.storage().resolveFile(st.getEnvMissingFileHandler(envSpec), "environment values", urlOrPath, st.getEnvMissingFileHandlerConfig(envSpec).resolveFileOptions()...)
 				if err != nil {
 					return nil, err
 				}
@@ -317,7 +360,10 @@ func (c *StateCreator) loadEnvValues(st *HelmState, name string, failOnMissingEn
 func (c *StateCreator) scatterGatherEnvSecretFiles(st *HelmState, envSecretFiles []string, envVals map[string]any, keepFileExtensions []string) ([]string, error) {
 	var errs []error
 	var decryptedFilesKeeper []string
-	helm := c.getHelm(st)
+	helm, err := c.getHelm(st)
+	if err != nil {
+		return nil, err
+	}
 	inputs := envSecretFiles
 	inputsSize := len(inputs)
 

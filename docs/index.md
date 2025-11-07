@@ -24,13 +24,10 @@ Deploy Kubernetes Helm Charts
 
 ## Status
 
-March 2022 Update - The helmfile project has been moved to [helmfile/helmfile](https://github.com/helmfile/helmfile) from the former home `roboll/helmfile`. Please see [roboll/helmfile#1824](https://github.com/roboll/helmfile/issues/1824) for more information.
+May 2025 Update
 
-Even though Helmfile is used in production environments [across multiple organizations](users.md), it is still in its early stage of development, hence versioned 0.x.
-
-Helmfile complies to Semantic Versioning 2.0.0 in which v0.x means that there could be backward-incompatible changes for every release.
-
-Note that we will try our best to document any backward incompatibility. And in reality, helmfile had no breaking change for a year or so.
+* Helmfile v1.0 and v1.1 has been released. We recommend upgrading directly to v1.1 if you are still using v0.x.
+* If you haven't already upgraded, please go over this v1 proposal [here](https://github.com/helmfile/helmfile/blob/main/docs/proposals/towards-1.0.md) to see a small list of breaking changes.
 
 ## About
 
@@ -197,8 +194,9 @@ helmDefaults:
   skipSchemaValidation: false
   # wait for k8s resources via --wait. (default false)
   wait: true
-  # if set and --wait enabled, will retry any failed check on resource state subject to the specified number of retries (default 0)
-  waitRetries: 3
+  # DEPRECATED: waitRetries is no longer supported as the --wait-retries flag was removed from Helm.
+  # This configuration is ignored and preserved only for backward compatibility.
+  # waitRetries: 3
   # if set and --wait enabled, will wait until all Jobs have been completed before marking the release as successful. It will wait for as long as --timeout (default false, Implemented in Helm3.5)
   waitForJobs: true
   # time in seconds to wait for any individual Kubernetes operation (like Jobs for hooks, and waits on pod/pvc/svc/deployment readiness) (default 300)
@@ -321,7 +319,8 @@ releases:
     #  --skip-schema-validation flag to helm 'install', 'upgrade' and 'lint', starts with helm 3.16.0 (default false)
     skipSchemaValidation: false
     wait: true
-    waitRetries: 3
+    # DEPRECATED: waitRetries is no longer supported - see documentation above
+    # waitRetries: 3
     waitForJobs: true
     timeout: 60
     recreatePods: true
@@ -329,6 +328,9 @@ releases:
     reuseValues: false
     # set `false` to uninstall this release on sync.  (default true)
     installed: true
+    # Defines the strategy to use when updating. Possible value is:
+    # - "reinstallIfForbidden": Performs an uninstall before the update only if the update is forbidden (e.g., due to permission issues or conflicts).
+    updateStrategy: ""
     # restores previous state in case of failed release (default false)
     atomic: true
     # when true, cleans up any new resources created during a failed release (default false)
@@ -412,9 +414,16 @@ helmfiles:
   # The nested-state file is locally checked-out along with the remote directory containing it.
   # Therefore all the local paths in the file are resolved relative to the file
   path: git::https://github.com/cloudposse/helmfiles.git@releases/kiam.yaml?ref=0.40.0
+- # By default git repositories aren't updated unless the ref is updated.
+  # Alternatively, refer to a named ref and disable the caching.
+  path: git::ssh://git@github.com/cloudposse/helmfiles.git@releases/kiam.yaml?ref=main&cache=false
 # If set to "Error", return an error when a subhelmfile points to a
 # non-existent path. The default behavior is to print a warning and continue.
 missingFileHandler: Error
+missingFileHandlerConfig:
+  # Ignores missing git branch error so that the Debug/Info/Warn handler can treat a missing branch as non-error.
+  # See https://github.com/helmfile/helmfile/issues/392
+  ignoreMissingGitBranch: true
 
 #
 # Advanced Configuration: Environments
@@ -570,7 +579,7 @@ Helmfile uses some OS environment variables to override default behaviour:
 * `HELMFILE_ENVIRONMENT` - specify [Helmfile environment](https://helmfile.readthedocs.io/en/latest/#environment), it has lower priority than CLI argument `--environment`
 * `HELMFILE_TEMPDIR` - specify directory to store temporary files
 * `HELMFILE_UPGRADE_NOTICE_DISABLED` - expecting any non-empty value to skip the check for the latest version of Helmfile in [helmfile version](https://helmfile.readthedocs.io/en/latest/#version)
-* `HELMFILE_GO_YAML_V3` - use *gopkg.in/yaml.v3* instead of *gopkg.in/yaml.v2*.  It's `false` by default in Helmfile v0.x, and `true` in Helmfile v1.x.
+* `HELMFILE_GO_YAML_V3` - use *go.yaml.in/yaml/v3* instead of *go.yaml.in/yaml/v2*.  It's `false` by default in Helmfile v0.x, and `true` in Helmfile v1.x.
 * `HELMFILE_CACHE_HOME` - specify directory to store cached files for remote operations
 * `HELMFILE_FILE_PATH` - specify the path to the helmfile.yaml file
 * `HELMFILE_INTERACTIVE` - enable interactive mode, expecting `true` lower case. The same as `--interactive` CLI flag
@@ -580,7 +589,7 @@ Helmfile uses some OS environment variables to override default behaviour:
 ```
 Declaratively deploy your Kubernetes manifests, Kustomize configs, and Charts as Helm releases in one shot
 V1 mode = false
-YAML library = gopkg.in/yaml.v3
+YAML library = go.yaml.in/yaml/v3
 
 Usage:
   helmfile [command]
@@ -642,6 +651,8 @@ Flags:
 Use "helmfile [command] --help" for more information about a command.
 ```
 
+**Note:** Each command has its own specific flags. Use `helmfile [command] --help` to see command-specific options. For example, `helmfile sync --help` shows operational flags like `--timeout`, `--wait`, and `--wait-for-jobs`.
+
 ### init
 
 The `helmfile init` sub-command checks the dependencies required for helmfile operation, such as `helm`, `helm diff plugin`, `helm secrets plugin`, `helm helm-git plugin`, `helm s3 plugin`. When it does not exist or the version is too low, it can be installed automatically.
@@ -656,6 +667,25 @@ The `helmfile sync` sub-command sync your cluster state as described in your `he
 
 Under the covers, Helmfile executes `helm upgrade --install` for each `release` declared in the manifest, by optionally decrypting [secrets](#secrets) to be consumed as helm chart values. It also updates specified chart repositories and updates the
 dependencies of any referenced local charts.
+
+#### Common sync flags
+
+* `--timeout SECONDS` - Override the default timeout for all releases in this sync operation. This takes precedence over `helmDefaults.timeout` and per-release `timeout` settings.
+* `--wait` - Override the default wait behavior for all releases
+* `--wait-for-jobs` - Override the default wait-for-jobs behavior for all releases
+
+Examples:
+
+```bash
+# Override timeout for all releases to 10 minutes
+helmfile sync --timeout 600
+
+# Combine timeout with wait flags
+helmfile sync --timeout 900 --wait --wait-for-jobs
+
+# Target specific releases with custom timeout
+helmfile sync --selector tier=backend --timeout 1200
+```
 
 For Helm 2.9+ you can use a username and password to authenticate to a remote repository.
 
