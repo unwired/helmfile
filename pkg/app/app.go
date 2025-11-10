@@ -200,7 +200,7 @@ func (a *App) Diff(c DiffConfigProvider) error {
 	}
 
 	if c.DetailedExitcode() && (len(allDiffDetectedErrs) > 0 || affectedAny) {
-		// We take the first release error w/ exit status 2 (although all the defered errs should have exit status 2)
+		// We take the first release error w/ exit status 2 (although all the deferred errs should have exit status 2)
 		// to just let helmfile itself to exit with 2
 		// See https://github.com/roboll/helmfile/issues/749
 		code := 2
@@ -350,8 +350,7 @@ func (a *App) Fetch(c FetchConfigProvider) error {
 			OutputDir:          c.OutputDir(),
 			OutputDirTemplate:  c.OutputDirTemplate(),
 			Concurrency:        c.Concurrency(),
-		}, func() {
-		})
+		}, func() {})
 
 		if prepErr != nil {
 			errs = append(errs, prepErr)
@@ -693,7 +692,7 @@ func (a *App) within(dir string, do func() error) error {
 
 	prev, err := a.fs.Getwd()
 	if err != nil {
-		return fmt.Errorf("failed getting current working direcotyr: %v", err)
+		return fmt.Errorf("failed getting current working directory: %v", err)
 	}
 
 	absDir, err := a.fs.Abs(dir)
@@ -797,7 +796,7 @@ func createHelmKey(bin, kubectx string) helmKey {
 //
 // This is currently used for running all the helm commands for reconciling releases. But this may change in the future
 // once we enable each release to have its own helm binary/version.
-func (a *App) getHelm(st *state.HelmState) helmexec.Interface {
+func (a *App) getHelm(st *state.HelmState) (helmexec.Interface, error) {
 	a.helmsMutex.Lock()
 	defer a.helmsMutex.Unlock()
 
@@ -806,20 +805,27 @@ func (a *App) getHelm(st *state.HelmState) helmexec.Interface {
 	}
 
 	bin := st.DefaultHelmBinary
+	if bin == "" {
+		bin = state.DefaultHelmBinary
+	}
 	kubeconfig := a.Kubeconfig
 	kubectx := st.HelmDefaults.KubeContext
 
 	key := createHelmKey(bin, kubectx)
 
 	if _, ok := a.helms[key]; !ok {
-		a.helms[key] = helmexec.New(bin, helmexec.HelmExecOptions{EnableLiveOutput: a.EnableLiveOutput, DisableForceUpdate: a.DisableForceUpdate}, a.Logger, kubeconfig, kubectx, &helmexec.ShellRunner{
+		exec, err := helmexec.New(bin, helmexec.HelmExecOptions{EnableLiveOutput: a.EnableLiveOutput, DisableForceUpdate: a.DisableForceUpdate}, a.Logger, kubeconfig, kubectx, &helmexec.ShellRunner{
 			Logger:                     a.Logger,
 			Ctx:                        a.ctx,
 			StripArgsValuesOnExitError: a.StripArgsValuesOnExitError,
 		})
+		if err != nil {
+			return nil, err
+		}
+		a.helms[key] = exec
 	}
 
-	return a.helms[key]
+	return a.helms[key], nil
 }
 
 func (a *App) visitStates(fileOrDir string, defOpts LoadOpts, converge func(*state.HelmState) (bool, []error)) error {
@@ -971,7 +977,10 @@ var (
 func (a *App) ForEachState(do func(*Run) (bool, []error), includeTransitiveNeeds bool, o ...LoadOption) error {
 	ctx := NewContext()
 	err := a.visitStatesWithSelectorsAndRemoteSupport(a.FileOrDir, func(st *state.HelmState) (bool, []error) {
-		helm := a.getHelm(st)
+		helm, err := a.getHelm(st)
+		if err != nil {
+			return false, []error{err}
+		}
 
 		run, err := NewRun(st, helm, ctx)
 		if err != nil {

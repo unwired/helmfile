@@ -201,7 +201,7 @@ func TestToYaml(t *testing.T) {
 		},
 		{
 			name:  "test unmarshalling issue 2024 with int64",
-			input: map[string]any{"thisShouldBeString": 1234567890123456789},
+			input: map[string]any{"thisShouldBeString": int64(1234567890123456789)},
 			expected: `thisShouldBeString: 1234567890123456789
 `,
 		},
@@ -358,11 +358,11 @@ func testFromYaml(t *testing.T, GoYamlV3 bool) {
 }
 
 func TestFromYaml(t *testing.T) {
-	t.Run("with gopkg.in/yaml.v2", func(t *testing.T) {
+	t.Run("with go.yaml.in/yaml/v2", func(t *testing.T) {
 		testFromYaml(t, true)
 	})
 
-	t.Run("with gopkg.in/yaml.v3", func(t *testing.T) {
+	t.Run("with go.yaml.in/yaml/v3", func(t *testing.T) {
 		testFromYaml(t, false)
 	})
 }

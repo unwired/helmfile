@@ -43,6 +43,9 @@ const (
 	// This is used by an interim solution to make the urfave/cli command report to the helmfile internal about that the
 	// --timeout flag is missingl
 	EmptyTimeout = -1
+
+	// Valid enum for updateStrategy values
+	UpdateStrategyReinstallIfForbidden = "reinstallIfForbidden"
 )
 
 // ReleaseSetSpec is release set spec
@@ -84,9 +87,9 @@ type ReleaseSetSpec struct {
 	// If set to "Error", return an error when a subhelmfile points to a
 	// non-existent path. The default behavior is to print a warning. Note the
 	// differing default compared to other MissingFileHandlers.
-	MissingFileHandler string `yaml:"missingFileHandler,omitempty"`
+	MissingFileHandler *string `yaml:"missingFileHandler,omitempty"`
 	// MissingFileHandlerConfig is composed of various settings for the MissingFileHandler
-	MissingFileHandlerConfig MissingFileHandlerConfig `yaml:"missingFileHandlerConfig,omitempty"`
+	MissingFileHandlerConfig *MissingFileHandlerConfig `yaml:"missingFileHandlerConfig,omitempty"`
 
 	LockFile string `yaml:"lockFilePath,omitempty"`
 }
@@ -163,6 +166,7 @@ type HelmSpec struct {
 	// Wait, if set to true, will wait until all Pods, PVCs, Services, and minimum number of Pods of a Deployment are in a ready state before marking the release as successful
 	Wait bool `yaml:"wait"`
 	// WaitRetries, if set and --wait enabled, will retry any failed check on resource state, except if HTTP status code < 500 is received, subject to the specified number of retries
+	// DEPRECATED: This field is ignored as the --wait-retries flag was removed from Helm. Preserved for backward compatibility.
 	WaitRetries int `yaml:"waitRetries"`
 	// WaitForJobs, if set and --wait enabled, will wait until all Jobs have been completed before marking the release as successful. It will wait for as long as --timeout
 	WaitForJobs bool `yaml:"waitForJobs"`
@@ -264,6 +268,7 @@ type ReleaseSpec struct {
 	// Wait, if set to true, will wait until all Pods, PVCs, Services, and minimum number of Pods of a Deployment are in a ready state before marking the release as successful
 	Wait *bool `yaml:"wait,omitempty"`
 	// WaitRetries, if set and --wait enabled, will retry any failed check on resource state, except if HTTP status code < 500 is received, subject to the specified number of retries
+	// DEPRECATED: This field is ignored as the --wait-retries flag was removed from Helm. Preserved for backward compatibility.
 	WaitRetries *int `yaml:"waitRetries,omitempty"`
 	// WaitForJobs, if set and --wait enabled, will wait until all Jobs have been completed before marking the release as successful. It will wait for as long as --timeout
 	WaitForJobs *bool `yaml:"waitForJobs,omitempty"`
@@ -275,6 +280,8 @@ type ReleaseSpec struct {
 	Force *bool `yaml:"force,omitempty"`
 	// Installed, when set to true, `delete --purge` the release
 	Installed *bool `yaml:"installed,omitempty"`
+	// UpdateStrategy, when set, indicate the strategy to use to update the release
+	UpdateStrategy string `yaml:"updateStrategy,omitempty"`
 	// Atomic, when set to true, restore previous state in case of a failed install/upgrade attempt
 	Atomic *bool `yaml:"atomic,omitempty"`
 	// CleanupOnFail, when set to true, the --cleanup-on-fail helm flag is passed to the upgrade command
@@ -307,6 +314,10 @@ type ReleaseSpec struct {
 	// MissingFileHandler is set to either "Error" or "Warn". "Error" instructs helmfile to fail when unable to find a values or secrets file. When "Warn", it prints the file and continues.
 	// The default value for MissingFileHandler is "Error".
 	MissingFileHandler *string `yaml:"missingFileHandler,omitempty"`
+
+	// MissingFileHandlerConfig is composed of various settings for the MissingFileHandler
+	MissingFileHandlerConfig *MissingFileHandlerConfig `yaml:"missingFileHandlerConfig,omitempty"`
+
 	// Needs is the [KUBECONTEXT/][NS/]NAME representations of releases that this release depends on.
 	Needs []string `yaml:"needs,omitempty"`
 
@@ -461,6 +472,7 @@ type SetValue struct {
 // AffectedReleases hold the list of released that where updated, deleted, or in error
 type AffectedReleases struct {
 	Upgraded     []*ReleaseSpec
+	Reinstalled  []*ReleaseSpec
 	Deleted      []*ReleaseSpec
 	Failed       []*ReleaseSpec
 	DeleteFailed []*ReleaseSpec
@@ -803,6 +815,7 @@ type SyncOpts struct {
 	Wait                 bool
 	WaitRetries          int
 	WaitForJobs          bool
+	Timeout              int
 	SyncReleaseLabels    bool
 	ReuseValues          bool
 	ResetValues          bool
@@ -1030,20 +1043,24 @@ func (st *HelmState) SyncReleases(affectedReleases *AffectedReleases, helm helme
 						}
 						m.Unlock()
 					}
-				} else if err := helm.SyncRelease(context, release.Name, chart, release.Namespace, flags...); err != nil {
-					m.Lock()
-					affectedReleases.Failed = append(affectedReleases.Failed, release)
-					m.Unlock()
-					relErr = newReleaseFailedError(release, err)
+				} else if release.UpdateStrategy == UpdateStrategyReinstallIfForbidden {
+					relErr = st.performSyncOrReinstallOfRelease(affectedReleases, helm, context, release, chart, m, flags...)
 				} else {
-					m.Lock()
-					affectedReleases.Upgraded = append(affectedReleases.Upgraded, release)
-					m.Unlock()
-					installedVersion, err := st.getDeployedVersion(context, helm, release)
-					if err != nil { // err is not really impacting so just log it
-						st.logger.Debugf("getting deployed release version failed: %v", err)
+					if err := helm.SyncRelease(context, release.Name, chart, release.Namespace, flags...); err != nil {
+						m.Lock()
+						affectedReleases.Failed = append(affectedReleases.Failed, release)
+						m.Unlock()
+						relErr = newReleaseFailedError(release, err)
 					} else {
-						release.installedVersion = installedVersion
+						m.Lock()
+						affectedReleases.Upgraded = append(affectedReleases.Upgraded, release)
+						m.Unlock()
+						installedVersion, err := st.getDeployedVersion(context, helm, release)
+						if err != nil { // err is not really impacting so just log it
+							st.logger.Debugf("getting deployed release version failed: %v", err)
+						} else {
+							release.installedVersion = installedVersion
+						}
 					}
 				}
 
@@ -1089,6 +1106,77 @@ func (st *HelmState) SyncReleases(affectedReleases *AffectedReleases, helm helme
 	return nil
 }
 
+func (st *HelmState) performSyncOrReinstallOfRelease(affectedReleases *AffectedReleases, helm helmexec.Interface, context helmexec.HelmContext, release *ReleaseSpec, chart string, m *sync.Mutex, flags ...string) *ReleaseError {
+	if err := helm.SyncRelease(context, release.Name, chart, release.Namespace, flags...); err != nil {
+		st.logger.Debugf("update strategy - sync failed: %s", err.Error())
+		// Only fail if a different error than forbidden updates
+		if !strings.Contains(err.Error(), "Forbidden: updates") {
+			st.logger.Debugf("update strategy - sync failed not due to Forbidden updates")
+			m.Lock()
+			affectedReleases.Failed = append(affectedReleases.Failed, release)
+			m.Unlock()
+			return newReleaseFailedError(release, err)
+		}
+	} else {
+		st.logger.Debugf("update strategy - sync success")
+		m.Lock()
+		affectedReleases.Upgraded = append(affectedReleases.Upgraded, release)
+		m.Unlock()
+		installedVersion, err := st.getDeployedVersion(context, helm, release)
+		if err != nil { // err is not really impacting so just log it
+			st.logger.Debugf("update strategy - getting deployed release version failed: %v", err)
+		} else {
+			release.installedVersion = installedVersion
+		}
+		return nil
+	}
+
+	st.logger.Infof("Failed to sync due to forbidden updates, attempting to reinstall %q allowed by update strategy", release.Name)
+	installed, err := st.isReleaseInstalled(context, helm, *release)
+	if err != nil {
+		return newReleaseFailedError(release, err)
+	}
+	if installed {
+		var args []string
+		if release.Namespace != "" {
+			args = append(args, "--namespace", release.Namespace)
+		}
+		deleteWaitFlag := true
+		release.DeleteWait = &deleteWaitFlag
+		args = st.appendDeleteWaitFlags(args, release)
+		deletionFlags := st.appendConnectionFlags(args, release)
+		m.Lock()
+		if _, err := st.triggerReleaseEvent("preuninstall", nil, release, "sync"); err != nil {
+			affectedReleases.Failed = append(affectedReleases.Failed, release)
+			return newReleaseFailedError(release, err)
+		} else if err := helm.DeleteRelease(context, release.Name, deletionFlags...); err != nil {
+			affectedReleases.Failed = append(affectedReleases.Failed, release)
+			return newReleaseFailedError(release, err)
+		} else if _, err := st.triggerReleaseEvent("postuninstall", nil, release, "sync"); err != nil {
+			affectedReleases.Failed = append(affectedReleases.Failed, release)
+			return newReleaseFailedError(release, err)
+		}
+		m.Unlock()
+	}
+	if err := helm.SyncRelease(context, release.Name, chart, release.Namespace, flags...); err != nil {
+		m.Lock()
+		affectedReleases.Failed = append(affectedReleases.Failed, release)
+		m.Unlock()
+		return newReleaseFailedError(release, err)
+	} else {
+		m.Lock()
+		affectedReleases.Reinstalled = append(affectedReleases.Reinstalled, release)
+		m.Unlock()
+		installedVersion, err := st.getDeployedVersion(context, helm, release)
+		if err != nil { // err is not really impacting so just log it
+			st.logger.Debugf("update strategy - getting deployed release version failed: %v", err)
+		} else {
+			release.installedVersion = installedVersion
+		}
+	}
+	return nil
+}
+
 func (st *HelmState) listReleases(context helmexec.HelmContext, helm helmexec.Interface, release *ReleaseSpec) (string, error) {
 	flags := st.kubeConnectionFlags(release)
 	if release.Namespace != "" {
@@ -1130,6 +1218,16 @@ func releasesNeedCharts(releases []ReleaseSpec) []ReleaseSpec {
 	}
 
 	return result
+}
+
+func filterReleasesForBuild(releases []ReleaseSpec) []ReleaseSpec {
+	var filteredReleases []ReleaseSpec
+	for _, r := range releases {
+		if len(r.JSONPatches) == 0 && len(r.StrategicMergePatches) == 0 && len(r.Transformers) == 0 {
+			filteredReleases = append(filteredReleases, r)
+		}
+	}
+	return filteredReleases
 }
 
 type ChartPrepareOptions struct {
@@ -1185,6 +1283,19 @@ func (st *HelmState) GetRepositoryAndNameFromChartName(chartName string) (*Repos
 	return nil, chartName
 }
 
+var mutexMap sync.Map
+
+// retrieves or creates a sync.Mutex for a given name
+func (st *HelmState) getNamedMutex(name string) *sync.Mutex {
+	mu, ok := mutexMap.Load(name)
+	if ok {
+		return mu.(*sync.Mutex)
+	}
+	newMu := &sync.Mutex{}
+	actualMu, _ := mutexMap.LoadOrStore(name, newMu)
+	return actualMu.(*sync.Mutex)
+}
+
 type PrepareChartKey struct {
 	Namespace, Name, KubeContext string
 }
@@ -1203,6 +1314,207 @@ type PrepareChartKey struct {
 // Otheriwse, if a chart is not a helm chart, it will call "chartify" to turn it into a chart.
 //
 // If exists, it will also patch resources by json patches, strategic-merge patches, and injectors.
+// processChartification handles the chartification process
+func (st *HelmState) processChartification(chartification *Chartify, release *ReleaseSpec, chartPath string, opts ChartPrepareOptions, skipDeps bool) (string, bool, error) {
+	c := chartify.New(
+		chartify.HelmBin(st.DefaultHelmBinary),
+		chartify.KustomizeBin(st.DefaultKustomizeBinary),
+		chartify.UseHelm3(true),
+		chartify.WithLogf(st.logger.Debugf),
+	)
+
+	chartifyOpts := chartification.Opts
+
+	if skipDeps {
+		chartifyOpts.SkipDeps = true
+	}
+
+	includeCRDs := true
+	if opts.IncludeCRDs != nil {
+		includeCRDs = *opts.IncludeCRDs
+	}
+	chartifyOpts.IncludeCRDs = includeCRDs
+
+	chartifyOpts.Validate = opts.Validate
+
+	chartifyOpts.KubeVersion = st.getKubeVersion(release, opts.KubeVersion)
+	chartifyOpts.ApiVersions = st.getApiVersions(release)
+
+	if opts.Values != nil {
+		chartifyOpts.ValuesFiles = append(opts.Values, chartifyOpts.ValuesFiles...)
+	}
+
+	// https://github.com/helmfile/helmfile/pull/867
+	// https://github.com/helmfile/helmfile/issues/895
+	var flags []string
+	for _, s := range opts.Set {
+		flags = append(flags, "--set", s)
+	}
+	chartifyOpts.SetFlags = append(chartifyOpts.SetFlags, flags...)
+
+	out, err := c.Chartify(release.Name, chartPath, chartify.WithChartifyOpts(chartifyOpts))
+	if err != nil {
+		return "", false, err
+	}
+
+	chartPath = out
+	// Skip `helm dep build` and `helm dep up` altogether when the chart is from remote or the dep is
+	// explicitly skipped.
+	buildDeps := !skipDeps
+	return chartPath, buildDeps, nil
+}
+
+// processLocalChart handles local chart processing
+func (st *HelmState) processLocalChart(normalizedChart, dir string, release *ReleaseSpec, helmfileCommand string, opts ChartPrepareOptions, isLocal bool) (string, error) {
+	chartPath := normalizedChart
+	if helmfileCommand == "pull" && isLocal {
+		chartAbsPath := strings.TrimSuffix(filepath.Clean(normalizedChart), "/")
+		var err error
+		chartPath, err = generateChartPath(filepath.Base(chartAbsPath), dir, release, opts.OutputDirTemplate)
+		if err != nil {
+			return "", err
+		}
+		if err := st.fs.CopyDir(normalizedChart, filepath.Clean(chartPath)); err != nil {
+			return "", err
+		}
+	}
+	return chartPath, nil
+}
+
+// forcedDownloadChart handles forced chart downloads
+func (st *HelmState) forcedDownloadChart(chartName, dir string, release *ReleaseSpec, helm helmexec.Interface, opts ChartPrepareOptions) (string, error) {
+	// Check global chart cache first for non-OCI charts
+	cacheKey := st.getChartCacheKey(release)
+	if cachedPath, exists := st.checkChartCache(cacheKey); exists && st.fs.DirectoryExistsAt(cachedPath) {
+		st.logger.Debugf("Chart %s:%s already downloaded, using cached version at %s", chartName, release.Version, cachedPath)
+		return cachedPath, nil
+	}
+
+	chartPath, err := generateChartPath(chartName, dir, release, opts.OutputDirTemplate)
+	if err != nil {
+		return "", err
+	}
+
+	// only fetch chart if it is not already fetched
+	if _, err := os.Stat(chartPath); os.IsNotExist(err) {
+		var fetchFlags []string
+		fetchFlags = st.appendChartVersionFlags(fetchFlags, release)
+		fetchFlags = append(fetchFlags, "--untar", "--untardir", chartPath)
+		if err := helm.Fetch(chartName, fetchFlags...); err != nil {
+			return "", err
+		}
+	} else {
+		st.logger.Infof("\"%s\" has not been downloaded because the output directory \"%s\" already exists", chartName, chartPath)
+	}
+
+	// Set chartPath to be the path containing Chart.yaml, if found
+	fullChartPath, err := findChartDirectory(chartPath)
+	if err == nil {
+		chartPath = filepath.Dir(fullChartPath)
+	}
+
+	// Add to global chart cache
+	st.addToChartCache(cacheKey, chartPath)
+
+	return chartPath, nil
+}
+
+// prepareChartForRelease processes a single release and prepares its chart
+func (st *HelmState) prepareChartForRelease(release *ReleaseSpec, helm helmexec.Interface, dir string, helmfileCommand string, opts ChartPrepareOptions, workerIndex int) *chartPrepareResult {
+	if st.OverrideChart != "" {
+		release.Chart = st.OverrideChart
+	}
+
+	// Call user-defined `prepare` hooks to create/modify local charts to be used by
+	// the later process.
+	//
+	// If it wasn't called here, Helmfile can end up an issue like
+	// https://github.com/roboll/helmfile/issues/1328
+	if _, err := st.triggerPrepareEvent(release, helmfileCommand); err != nil {
+		return &chartPrepareResult{err: err}
+	}
+
+	chartName := release.Chart
+
+	chartPath, err := st.downloadChartWithGoGetter(release)
+	if err != nil {
+		return &chartPrepareResult{err: fmt.Errorf("release %q: %w", release.Name, err)}
+	}
+	chartFetchedByGoGetter := chartPath != chartName
+
+	if !chartFetchedByGoGetter {
+		ociChartPath, err := st.getOCIChart(release, dir, helm, opts)
+		if err != nil {
+			return &chartPrepareResult{err: fmt.Errorf("release %q: %w", release.Name, err)}
+		}
+
+		if ociChartPath != nil {
+			chartPath = *ociChartPath
+		}
+	}
+
+	isLocal := st.fs.DirectoryExistsAt(normalizeChart(st.basePath, chartName))
+
+	chartification, clean, err := st.PrepareChartify(helm, release, chartPath, workerIndex)
+
+	if !opts.SkipCleanup {
+		// nolint: staticcheck
+		defer clean()
+	}
+
+	if err != nil {
+		return &chartPrepareResult{err: err}
+	}
+
+	var buildDeps bool
+
+	skipDepsGlobal := opts.SkipDeps
+	skipDepsRelease := release.SkipDeps != nil && *release.SkipDeps
+	skipDepsDefault := release.SkipDeps == nil && st.HelmDefaults.SkipDeps
+	skipDeps := (!isLocal && !chartFetchedByGoGetter) || skipDepsGlobal || skipDepsRelease || skipDepsDefault
+
+	if chartification != nil && helmfileCommand != "pull" {
+		chartPath, buildDeps, err = st.processChartification(chartification, release, chartPath, opts, skipDeps)
+		if err != nil {
+			return &chartPrepareResult{err: err}
+		}
+	} else if normalizedChart := normalizeChart(st.basePath, chartPath); st.fs.DirectoryExistsAt(normalizedChart) {
+		chartPath, err = st.processLocalChart(normalizedChart, dir, release, helmfileCommand, opts, isLocal)
+		if err != nil {
+			return &chartPrepareResult{err: err}
+		}
+		buildDeps = !skipDeps
+	} else if !opts.ForceDownload {
+		// At this point, we are sure that either:
+		// 1. It is a local chart and we can use it in later process (helm upgrade/template/lint/etc)
+		//    without any modification, or
+		// 2. It is a remote chart which can be safely handed over to helm,
+		//    because the version of Helm used in this transaction (helm v3 or greater) support downloading
+		//    the chart instead, AND we don't need any modification to the chart
+		//
+		//    Also see HelmState.chartVersionFlags(). For `helmfile template`, it's called before `helm template`
+		//    only on helm v3.
+		//    For helm 2, we `helm fetch` with the version flags and call `helm template`
+		//    WITHOUT the version flags.
+	} else {
+		chartPath, err = st.forcedDownloadChart(chartName, dir, release, helm, opts)
+		if err != nil {
+			return &chartPrepareResult{err: err}
+		}
+	}
+
+	return &chartPrepareResult{
+		releaseName:            release.Name,
+		chartName:              chartName,
+		releaseNamespace:       release.Namespace,
+		releaseContext:         release.KubeContext,
+		chartPath:              chartPath,
+		buildDeps:              buildDeps,
+		skipRefresh:            !isLocal || opts.SkipRefresh,
+		chartFetchedByGoGetter: chartFetchedByGoGetter,
+	}
+}
+
 func (st *HelmState) PrepareCharts(helm helmexec.Interface, dir string, concurrency int, helmfileCommand string, opts ChartPrepareOptions) (map[PrepareChartKey]string, []error) {
 	if !opts.SkipResolve {
 		updated, err := st.ResolveDeps()
@@ -1217,6 +1529,12 @@ func (st *HelmState) PrepareCharts(helm helmexec.Interface, dir string, concurre
 	}
 
 	releases := releasesNeedCharts(selected)
+
+	// For build command, skip releases that require chartify (jsonPatches, etc.)
+	// as we only need to output state, not actually template the charts
+	if helmfileCommand == "build" {
+		releases = filterReleasesForBuild(releases)
+	}
 
 	var prepareChartInfoMutex sync.Mutex
 
@@ -1240,186 +1558,8 @@ func (st *HelmState) PrepareCharts(helm helmexec.Interface, dir string, concurre
 		},
 		func(workerIndex int) {
 			for release := range jobQueue {
-				if st.OverrideChart != "" {
-					release.Chart = st.OverrideChart
-				}
-				// Call user-defined `prepare` hooks to create/modify local charts to be used by
-				// the later process.
-				//
-				// If it wasn't called here, Helmfile can end up an issue like
-				// https://github.com/roboll/helmfile/issues/1328
-				if _, err := st.triggerPrepareEvent(release, helmfileCommand); err != nil {
-					results <- &chartPrepareResult{err: err}
-					return
-				}
-
-				chartName := release.Chart
-
-				chartPath, err := st.downloadChartWithGoGetter(release)
-				if err != nil {
-					results <- &chartPrepareResult{err: fmt.Errorf("release %q: %w", release.Name, err)}
-					return
-				}
-				chartFetchedByGoGetter := chartPath != chartName
-
-				if !chartFetchedByGoGetter {
-					ociChartPath, err := st.getOCIChart(release, dir, helm, opts.OutputDirTemplate)
-					if err != nil {
-						results <- &chartPrepareResult{err: fmt.Errorf("release %q: %w", release.Name, err)}
-
-						return
-					}
-
-					if ociChartPath != nil {
-						chartPath = *ociChartPath
-					}
-				}
-
-				isLocal := st.fs.DirectoryExistsAt(normalizeChart(st.basePath, chartName))
-
-				chartification, clean, err := st.PrepareChartify(helm, release, chartPath, workerIndex)
-
-				if !opts.SkipCleanup {
-					// nolint: staticcheck
-					defer clean()
-				}
-
-				if err != nil {
-					results <- &chartPrepareResult{err: err}
-					return
-				}
-
-				var buildDeps bool
-
-				skipDepsGlobal := opts.SkipDeps
-				skipDepsRelease := release.SkipDeps != nil && *release.SkipDeps
-				skipDepsDefault := release.SkipDeps == nil && st.HelmDefaults.SkipDeps
-				skipDeps := (!isLocal && !chartFetchedByGoGetter) || skipDepsGlobal || skipDepsRelease || skipDepsDefault
-
-				if chartification != nil && helmfileCommand != "pull" {
-					c := chartify.New(
-						chartify.HelmBin(st.DefaultHelmBinary),
-						chartify.KustomizeBin(st.DefaultKustomizeBinary),
-						chartify.UseHelm3(true),
-						chartify.WithLogf(st.logger.Debugf),
-					)
-
-					chartifyOpts := chartification.Opts
-
-					if skipDeps {
-						chartifyOpts.SkipDeps = true
-					}
-
-					includeCRDs := true
-					if opts.IncludeCRDs != nil {
-						includeCRDs = *opts.IncludeCRDs
-					}
-					chartifyOpts.IncludeCRDs = includeCRDs
-
-					chartifyOpts.Validate = opts.Validate
-
-					chartifyOpts.KubeVersion = st.getKubeVersion(release, opts.KubeVersion)
-					chartifyOpts.ApiVersions = st.getApiVersions(release)
-
-					if opts.Values != nil {
-						chartifyOpts.ValuesFiles = append(opts.Values, chartifyOpts.ValuesFiles...)
-					}
-
-					// https://github.com/helmfile/helmfile/pull/867
-					// https://github.com/helmfile/helmfile/issues/895
-					var flags []string
-					for _, s := range opts.Set {
-						flags = append(flags, "--set", s)
-					}
-					chartifyOpts.SetFlags = append(chartifyOpts.SetFlags, flags...)
-
-					out, err := c.Chartify(release.Name, chartPath, chartify.WithChartifyOpts(chartifyOpts))
-					if err != nil {
-						results <- &chartPrepareResult{err: err}
-						return
-					} else {
-						chartPath = out
-					}
-
-					// Skip `helm dep build` and `helm dep up` altogether when the chart is from remote or the dep is
-					// explicitly skipped.
-					buildDeps = !skipDeps
-				} else if normalizedChart := normalizeChart(st.basePath, chartPath); st.fs.DirectoryExistsAt(normalizedChart) {
-					// At this point, we are sure that chartPath is a local directory containing either:
-					// - A remote chart fetched by go-getter or
-					// - A local chart
-					//
-					// The chart may have Chart.yaml(and requirements.yaml for Helm 2), and optionally Chart.lock/requirements.lock,
-					// but no `charts/` directory populated at all, or a subet of chart dependencies are missing in the directory.
-					//
-					// In such situation, Helm fails with an error like:
-					//   Error: found in Chart.yaml, but missing in charts/ directory: cert-manager, prometheus, postgresql, gitlab-runner, grafana, redis
-					//
-					// (See also https://github.com/roboll/helmfile/issues/1401#issuecomment-670854495)
-					//
-					// To avoid it, we need to call a `helm dep build` command on the chart.
-					// But the command may consistently fail when an outdated Chart.lock exists.
-					//
-					// (I've mentioned about such case in https://github.com/roboll/helmfile/pull/1400.)
-					//
-					// Trying to run `helm dep build` on the chart regardless of if it's from local or remote is
-					// problematic, as usually the user would have no way to fix the remote chart on their own.
-					//
-					// Given that, we always run `helm dep build` on the chart here, but tolerate any error caused by it
-					// for a remote chart, so that the user can notice/fix the issue in a local chart while
-					// a broken remote chart won't completely block their job.
-					chartPath = normalizedChart
-
-					buildDeps = !skipDeps
-				} else if !opts.ForceDownload {
-					// At this point, we are sure that either:
-					// 1. It is a local chart and we can use it in later process (helm upgrade/template/lint/etc)
-					//    without any modification, or
-					// 2. It is a remote chart which can be safely handed over to helm,
-					//    because the version of Helm used in this transaction (helm v3 or greater) support downloading
-					//    the chart instead, AND we don't need any modification to the chart
-					//
-					//    Also see HelmState.chartVersionFlags(). For `helmfile template`, it's called before `helm template`
-					//    only on helm v3.
-					//    For helm 2, we `helm fetch` with the version flags and call `helm template`
-					//    WITHOUT the version flags.
-				} else {
-					chartPath, err = generateChartPath(chartName, dir, release, opts.OutputDirTemplate)
-					if err != nil {
-						results <- &chartPrepareResult{err: err}
-						return
-					}
-
-					// only fetch chart if it is not already fetched
-					if _, err := os.Stat(chartPath); os.IsNotExist(err) {
-						var fetchFlags []string
-						fetchFlags = st.appendChartVersionFlags(fetchFlags, release)
-						fetchFlags = append(fetchFlags, "--untar", "--untardir", chartPath)
-						if err := helm.Fetch(chartName, fetchFlags...); err != nil {
-							results <- &chartPrepareResult{err: err}
-							return
-						}
-					} else {
-						st.logger.Infof("\"%s\" has not been downloaded because the output directory \"%s\" already exists", chartName, chartPath)
-					}
-
-					// Set chartPath to be the path containing Chart.yaml, if found
-					fullChartPath, err := findChartDirectory(chartPath)
-					if err == nil {
-						chartPath = filepath.Dir(fullChartPath)
-					}
-				}
-
-				results <- &chartPrepareResult{
-					releaseName:            release.Name,
-					chartName:              chartName,
-					releaseNamespace:       release.Namespace,
-					releaseContext:         release.KubeContext,
-					chartPath:              chartPath,
-					buildDeps:              buildDeps,
-					skipRefresh:            !isLocal || opts.SkipRefresh,
-					chartFetchedByGoGetter: chartFetchedByGoGetter,
-				}
+				result := st.prepareChartForRelease(release, helm, dir, helmfileCommand, opts, workerIndex)
+				results <- result
 			}
 		},
 		func() {
@@ -1884,7 +2024,7 @@ func (st *HelmState) prepareDiffReleases(helm helmexec.Interface, additionalValu
 	mu := &sync.RWMutex{}
 	installedReleases := map[string]bool{}
 
-	isInstalled := func(r *ReleaseSpec) bool {
+	isInstalled := func(r *ReleaseSpec) (bool, error) {
 		id := ReleaseToID(r)
 
 		mu.RLock()
@@ -1892,19 +2032,19 @@ func (st *HelmState) prepareDiffReleases(helm helmexec.Interface, additionalValu
 		mu.RUnlock()
 
 		if ok {
-			return v
+			return v, nil
 		}
 
 		v, err := st.isReleaseInstalled(st.createHelmContext(r, 0), helm, *r)
 		if err != nil {
-			st.logger.Warnf("confirming if the release is already installed or not: %v", err)
-		} else {
-			mu.Lock()
-			installedReleases[id] = v
-			mu.Unlock()
+			return false, err
 		}
 
-		return v
+		mu.Lock()
+		installedReleases[id] = v
+		mu.Unlock()
+
+		return v, nil
 	}
 
 	releases := []*ReleaseSpec{}
@@ -1949,12 +2089,25 @@ func (st *HelmState) prepareDiffReleases(helm helmexec.Interface, additionalValu
 					suppressDiff = true
 				}
 
-				if opt.SkipDiffOnInstall && !isInstalled(release) {
-					results <- diffPrepareResult{release: release, upgradeDueToSkippedDiff: true, suppressDiff: suppressDiff}
-					continue
+				if opt.SkipDiffOnInstall {
+					installed, err := isInstalled(release)
+					if err != nil {
+						errs = append(errs, err)
+					} else if !installed {
+						results <- diffPrepareResult{release: release, upgradeDueToSkippedDiff: true, suppressDiff: suppressDiff}
+						continue
+					}
 				}
 
-				disableValidation := release.DisableValidationOnInstall != nil && *release.DisableValidationOnInstall && !isInstalled(release)
+				var disableValidation bool
+				if release.DisableValidationOnInstall != nil && *release.DisableValidationOnInstall {
+					installed, err := isInstalled(release)
+					if err != nil {
+						errs = append(errs, err)
+					} else {
+						disableValidation = !installed
+					}
+				}
 
 				// TODO We need a long-term fix for this :)
 				// See https://github.com/roboll/helmfile/issues/737
@@ -2269,7 +2422,7 @@ func (st *HelmState) TestReleases(helm helmexec.Interface, cleanup bool, timeout
 		}
 
 		if timeout == EmptyTimeout {
-			flags = append(flags, st.timeoutFlags(&release)...)
+			flags = append(flags, st.timeoutFlags(&release, nil)...)
 		} else {
 			duration := strconv.Itoa(timeout)
 			duration += "s"
@@ -2696,6 +2849,14 @@ func (st *HelmState) appendKeyringFlags(flags []string, release *ReleaseSpec) []
 	return flags
 }
 
+// appendEnableDNSFlags append the helm command-line flag for DNS resolution
+func (st *HelmState) appendEnableDNSFlags(flags []string, release *ReleaseSpec) []string {
+	if release.EnableDNS != nil && *release.EnableDNS || release.EnableDNS == nil && st.HelmDefaults.EnableDNS {
+		flags = append(flags, "--enable-dns")
+	}
+	return flags
+}
+
 func (st *HelmState) kubeConnectionFlags(release *ReleaseSpec) []string {
 	flags := []string{}
 	if release.KubeContext != "" {
@@ -2749,12 +2910,15 @@ func (st *HelmState) needsInsecureSkipTLSVerify(release *ReleaseSpec, repo *Repo
 	return relSkipTLSVerify || st.HelmDefaults.InsecureSkipTLSVerify || repoSkipTLSVerify
 }
 
-func (st *HelmState) timeoutFlags(release *ReleaseSpec) []string {
+func (st *HelmState) timeoutFlags(release *ReleaseSpec, ops *SyncOpts) []string {
 	var flags []string
 
 	timeout := st.HelmDefaults.Timeout
 	if release.Timeout != nil {
 		timeout = *release.Timeout
+	}
+	if ops != nil && ops.Timeout > 0 {
+		timeout = ops.Timeout
 	}
 	if timeout != 0 {
 		duration := strconv.Itoa(timeout)
@@ -2768,11 +2932,9 @@ func (st *HelmState) timeoutFlags(release *ReleaseSpec) []string {
 func (st *HelmState) flagsForUpgrade(helm helmexec.Interface, release *ReleaseSpec, workerIndex int, opt *SyncOpts) ([]string, []string, error) {
 	var flags []string
 	flags = st.appendChartVersionFlags(flags, release)
-	if release.EnableDNS != nil && *release.EnableDNS || release.EnableDNS == nil && st.HelmDefaults.EnableDNS {
-		flags = append(flags, "--enable-dns")
-	}
+	flags = st.appendEnableDNSFlags(flags, release)
 
-	flags = st.appendWaitFlags(flags, helm, release, opt)
+	flags = st.appendWaitFlags(flags, release, opt)
 	flags = st.appendWaitForJobsFlags(flags, release, opt)
 
 	// non-OCI chart should be verified here
@@ -2781,7 +2943,7 @@ func (st *HelmState) flagsForUpgrade(helm helmexec.Interface, release *ReleaseSp
 		flags = st.appendKeyringFlags(flags, release)
 	}
 
-	flags = append(flags, st.timeoutFlags(release)...)
+	flags = append(flags, st.timeoutFlags(release, opt)...)
 
 	if release.Force != nil && *release.Force || release.Force == nil && st.HelmDefaults.Force {
 		flags = append(flags, "--force")
@@ -2895,6 +3057,7 @@ func (st *HelmState) flagsForDiff(helm helmexec.Interface, release *ReleaseSpec,
 	settings := cli.New()
 	var flags []string
 	flags = st.appendChartVersionFlags(flags, release)
+	flags = st.appendEnableDNSFlags(flags, release)
 
 	disableOpenAPIValidation := false
 	if release.DisableOpenAPIValidation != nil {
@@ -3208,7 +3371,7 @@ func (st *HelmState) ExpandedHelmfiles() ([]SubHelmfileSpec, error) {
 		}
 		if len(matches) == 0 {
 			err := fmt.Errorf("no matches for path: %s", hf.Path)
-			if st.MissingFileHandler == "Error" {
+			if *st.getMissingFileHandler() == "Error" {
 				return nil, err
 			}
 			st.logger.Warnf("no matches for path: %s", hf.Path)
@@ -3255,19 +3418,67 @@ func (st *HelmState) removeFiles(files []string) {
 	}
 }
 
-func (c MissingFileHandlerConfig) resolveFileOptions() []resolveFileOption {
+func (c *MissingFileHandlerConfig) resolveFileOptions() []resolveFileOption {
+	if c == nil {
+		return []resolveFileOption{
+			ignoreMissingGitBranch(false),
+		}
+	}
 	return []resolveFileOption{
 		ignoreMissingGitBranch(c.IgnoreMissingGitBranch),
 	}
 }
 
-func (st *HelmState) generateTemporaryReleaseValuesFiles(release *ReleaseSpec, values []any, missingFileHandler *string) ([]string, error) {
+// getReleaseMissingFileHandlerConfig returns the first non-nil MissingFileHandlerConfig in the following order:
+// - release.MissingFileHandlerConfig
+// - st.MissingFileHandlerConfig
+func (st *HelmState) getReleaseMissingFileHandlerConfig(release *ReleaseSpec) *MissingFileHandlerConfig {
+	switch {
+	case release.MissingFileHandlerConfig != nil:
+		return release.MissingFileHandlerConfig
+	case st.MissingFileHandlerConfig != nil:
+		return st.MissingFileHandlerConfig
+	default:
+		return nil
+	}
+}
+
+// getReleaseMissingFileHandler returns the first non-nil MissingFileHandler in the following order:
+// - release.MissingFileHandler
+// - st.MissingFileHandler
+// - "Error"
+func (st *HelmState) getReleaseMissingFileHandler(release *ReleaseSpec) *string {
+	defaultMissingFileHandler := "Error"
+	switch {
+	case release.MissingFileHandler != nil:
+		return release.MissingFileHandler
+	case st.MissingFileHandler != nil:
+		return st.MissingFileHandler
+	default:
+		return &defaultMissingFileHandler
+	}
+}
+
+// getMissingFileHandler returns the first non-nil MissingFileHandler in the following order:
+// - st.MissingFileHandler
+// - "Error"
+func (st *HelmState) getMissingFileHandler() *string {
+	defaultMissingFileHandler := "Error"
+	switch {
+	case st.MissingFileHandler != nil:
+		return st.MissingFileHandler
+	default:
+		return &defaultMissingFileHandler
+	}
+}
+
+func (st *HelmState) generateTemporaryReleaseValuesFiles(release *ReleaseSpec, values []any) ([]string, error) {
 	generatedFiles := []string{}
 
 	for _, value := range values {
 		switch typedValue := value.(type) {
 		case string:
-			paths, skip, err := st.storage().resolveFile(missingFileHandler, "values", typedValue, st.MissingFileHandlerConfig.resolveFileOptions()...)
+			paths, skip, err := st.storage().resolveFile(st.getReleaseMissingFileHandler(release), "values", typedValue, st.getReleaseMissingFileHandlerConfig(release).resolveFileOptions()...)
 			if err != nil {
 				return generatedFiles, err
 			}
@@ -3348,7 +3559,7 @@ func (st *HelmState) generateVanillaValuesFiles(release *ReleaseSpec) ([]string,
 		return nil, fmt.Errorf("Failed to render values in %s for release %s: type %T isn't supported", st.FilePath, release.Name, valuesMapSecretsRendered["values"])
 	}
 
-	generatedFiles, err := st.generateTemporaryReleaseValuesFiles(release, valuesSecretsRendered, release.MissingFileHandler)
+	generatedFiles, err := st.generateTemporaryReleaseValuesFiles(release, valuesSecretsRendered)
 	if err != nil {
 		return nil, err
 	}
@@ -3414,7 +3625,7 @@ func (st *HelmState) generateSecretValuesFiles(helm helmexec.Interface, release 
 		generatedDecryptedFiles = append(generatedDecryptedFiles, valfile)
 	}
 
-	generatedFiles, err := st.generateTemporaryReleaseValuesFiles(release, generatedDecryptedFiles, release.MissingFileHandler)
+	generatedFiles, err := st.generateTemporaryReleaseValuesFiles(release, generatedDecryptedFiles)
 	if err != nil {
 		return nil, err
 	}
@@ -3607,6 +3818,28 @@ func (ar *AffectedReleases) DisplayAffectedReleases(logger *zap.SugaredLogger) {
 		)
 		tbl.Separator = "   "
 		for _, release := range ar.Upgraded {
+			modifiedChart, modErr := hideChartCredentials(release.Chart)
+			if modErr != nil {
+				logger.Warn("Could not modify chart credentials, %v", modErr)
+				continue
+			}
+			err := tbl.AddRow(release.Name, release.Namespace, modifiedChart, release.installedVersion, release.duration.Round(time.Second))
+			if err != nil {
+				logger.Warn("Could not add row, %v", err)
+			}
+		}
+		logger.Info(tbl.String())
+	}
+	if len(ar.Reinstalled) > 0 {
+		logger.Info("\nREINSTALLED RELEASES:")
+		tbl, _ := prettytable.NewTable(prettytable.Column{Header: "NAME"},
+			prettytable.Column{Header: "NAMESPACE", MinWidth: 6},
+			prettytable.Column{Header: "CHART", MinWidth: 6},
+			prettytable.Column{Header: "VERSION", MinWidth: 6},
+			prettytable.Column{Header: "DURATION", AlignRight: true},
+		)
+		tbl.Separator = "   "
+		for _, release := range ar.Reinstalled {
 			modifiedChart, modErr := hideChartCredentials(release.Chart)
 			if modErr != nil {
 				logger.Warn("Could not modify chart credentials, %v", modErr)
@@ -3951,7 +4184,48 @@ func (st *HelmState) Reverse() {
 	}
 }
 
-func (st *HelmState) getOCIChart(release *ReleaseSpec, tempDir string, helm helmexec.Interface, outputDirTemplate string) (*string, error) {
+// Chart cache for both OCI and non-OCI charts to avoid duplicate downloads
+type ChartCacheKey struct {
+	Chart   string
+	Version string
+}
+
+var downloadedCharts = make(map[ChartCacheKey]string) // key -> chart path
+var downloadedChartsMutex sync.RWMutex
+
+// Legacy OCI-specific cache (kept for backward compatibility)
+var downloadedOCICharts = make(map[string]bool)
+var downloadedOCIMutex sync.RWMutex
+
+// getChartCacheKey creates a cache key for a chart and version
+func (st *HelmState) getChartCacheKey(release *ReleaseSpec) ChartCacheKey {
+	version := release.Version
+	if version == "" {
+		// Use empty string for latest version
+		version = ""
+	}
+	return ChartCacheKey{
+		Chart:   release.Chart,
+		Version: version,
+	}
+}
+
+// checkChartCache checks if a chart is already downloaded and returns its path
+func (st *HelmState) checkChartCache(key ChartCacheKey) (string, bool) {
+	downloadedChartsMutex.RLock()
+	defer downloadedChartsMutex.RUnlock()
+	path, exists := downloadedCharts[key]
+	return path, exists
+}
+
+// addToChartCache adds a chart to the cache
+func (st *HelmState) addToChartCache(key ChartCacheKey, path string) {
+	downloadedChartsMutex.Lock()
+	defer downloadedChartsMutex.Unlock()
+	downloadedCharts[key] = path
+}
+
+func (st *HelmState) getOCIChart(release *ReleaseSpec, tempDir string, helm helmexec.Interface, opts ChartPrepareOptions) (*string, error) {
 	qualifiedChartName, chartName, chartVersion, err := st.getOCIQualifiedChartName(release, helm)
 	if err != nil {
 		return nil, err
@@ -3961,7 +4235,41 @@ func (st *HelmState) getOCIChart(release *ReleaseSpec, tempDir string, helm helm
 		return nil, nil
 	}
 
-	chartPath, _ := st.getOCIChartPath(tempDir, release, chartName, chartVersion, outputDirTemplate)
+	// Check global chart cache first
+	cacheKey := st.getChartCacheKey(release)
+	if cachedPath, exists := st.checkChartCache(cacheKey); exists && st.fs.DirectoryExistsAt(cachedPath) {
+		st.logger.Debugf("OCI chart %s:%s already downloaded, using cached version at %s", chartName, chartVersion, cachedPath)
+		return &cachedPath, nil
+	}
+
+	if opts.OutputDirTemplate == "" {
+		tempDir = remote.CacheDir()
+	}
+
+	chartPath, _ := st.getOCIChartPath(tempDir, release, chartName, chartVersion, opts.OutputDirTemplate)
+
+	mu := st.getNamedMutex(chartPath)
+	mu.Lock()
+	defer mu.Unlock()
+
+	_, err = os.Stat(tempDir)
+	if err != nil {
+		err = os.MkdirAll(tempDir, 0755)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	downloadedOCIMutex.RLock()
+	alreadyDownloadedFlag := downloadedOCICharts[chartPath]
+	downloadedOCIMutex.RUnlock()
+
+	if !opts.SkipDeps && !opts.SkipRefresh && !alreadyDownloadedFlag {
+		err = os.RemoveAll(chartPath)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	if st.fs.DirectoryExistsAt(chartPath) {
 		st.logger.Debugf("chart already exists at %s", chartPath)
@@ -3988,7 +4296,14 @@ func (st *HelmState) getOCIChart(release *ReleaseSpec, tempDir string, helm helm
 		return nil, err
 	}
 
+	downloadedOCIMutex.Lock()
+	downloadedOCICharts[chartPath] = true
+	downloadedOCIMutex.Unlock()
+
 	chartPath = filepath.Dir(fullChartPath)
+
+	// Add to global chart cache
+	st.addToChartCache(cacheKey, chartPath)
 
 	return &chartPath, nil
 }
@@ -4054,15 +4369,15 @@ func (st *HelmState) getOCIChartPath(tempDir string, release *ReleaseSpec, chart
 
 	pathElems := []string{tempDir}
 
-	if release.Namespace != "" {
-		pathElems = append(pathElems, release.Namespace)
-	}
+	replacer := strings.NewReplacer(
+		":", "_",
+		"//", "_",
+		".", "_",
+		"&", "_",
+	)
+	qName := strings.Split(replacer.Replace(release.Chart), "/")
 
-	if release.KubeContext != "" {
-		pathElems = append(pathElems, release.KubeContext)
-	}
-
-	pathElems = append(pathElems, release.Name, chartName, safeVersionPath(chartVersion))
-
+	pathElems = append(pathElems, qName...)
+	pathElems = append(pathElems, safeVersionPath(chartVersion))
 	return filepath.Join(pathElems...), nil
 }

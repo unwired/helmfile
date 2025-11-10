@@ -170,6 +170,7 @@ func TestHelmState_flagsForUpgrade(t *testing.T) {
 		version  *semver.Version
 		defaults HelmSpec
 		release  *ReleaseSpec
+		syncOpts *SyncOpts
 		want     []string
 		wantErr  string
 	}{
@@ -456,6 +457,27 @@ func TestHelmState_flagsForUpgrade(t *testing.T) {
 			},
 		},
 		{
+			name: "timeout-from-cli-flag",
+			defaults: HelmSpec{
+				Timeout: 123,
+			},
+			release: &ReleaseSpec{
+				Chart:     "test/chart",
+				Version:   "0.1",
+				Timeout:   some(456),
+				Name:      "test-charts",
+				Namespace: "test-namespace",
+			},
+			syncOpts: &SyncOpts{
+				Timeout: 789,
+			},
+			want: []string{
+				"--version", "0.1",
+				"--timeout", "789s",
+				"--namespace", "test-namespace",
+			},
+		},
+		{
 			name: "atomic",
 			defaults: HelmSpec{
 				Atomic: false,
@@ -737,7 +759,7 @@ func TestHelmState_flagsForUpgrade(t *testing.T) {
 				Version: tt.version,
 			}
 
-			args, _, err := state.flagsForUpgrade(helm, tt.release, 0, nil)
+			args, _, err := state.flagsForUpgrade(helm, tt.release, 0, tt.syncOpts)
 			if err != nil && tt.wantErr == "" {
 				t.Errorf("unexpected error flagsForUpgrade: %v", err)
 			}
@@ -1618,6 +1640,112 @@ func TestHelmState_SyncReleasesAffectedRealeases(t *testing.T) {
 	}
 }
 
+func TestHelmState_SyncReleasesAffectedReleasesWithReinstallIfForbidden(t *testing.T) {
+	no := false
+	tests := []struct {
+		name         string
+		releases     []ReleaseSpec
+		installed    []bool
+		wantAffected exectest.Affected
+	}{
+		{
+			name: "2 new",
+			releases: []ReleaseSpec{
+				{
+					Name:           "releaseNameFoo-forbidden",
+					Chart:          "foo",
+					UpdateStrategy: "reinstallIfForbidden",
+				},
+				{
+					Name:           "releaseNameBar-forbidden",
+					Chart:          "foo",
+					UpdateStrategy: "reinstallIfForbidden",
+				},
+			},
+			wantAffected: exectest.Affected{
+				Upgraded: []*exectest.Release{
+					{Name: "releaseNameFoo-forbidden", Flags: []string{}},
+					{Name: "releaseNameBar-forbidden", Flags: []string{}},
+				},
+				Reinstalled: nil,
+				Deleted:     nil,
+				Failed:      nil,
+			},
+		},
+		{
+			name: "1 removed, 1 new, 1 reinstalled first new",
+			releases: []ReleaseSpec{
+				{
+					Name:           "releaseNameFoo-forbidden",
+					Chart:          "foo",
+					UpdateStrategy: "reinstallIfForbidden",
+				},
+				{
+					Name:           "releaseNameBar",
+					Chart:          "foo",
+					UpdateStrategy: "reinstallIfForbidden",
+					Installed:      &no,
+				},
+				{
+					Name:           "releaseNameFoo-forbidden",
+					Chart:          "foo",
+					UpdateStrategy: "reinstallIfForbidden",
+				},
+			},
+			installed: []bool{true, true, true},
+			wantAffected: exectest.Affected{
+				Upgraded: []*exectest.Release{
+					{Name: "releaseNameFoo-forbidden", Flags: []string{}},
+				},
+				Reinstalled: []*exectest.Release{
+					{Name: "releaseNameFoo-forbidden", Flags: []string{}},
+				},
+				Deleted: []*exectest.Release{
+					{Name: "releaseNameBar", Flags: []string{}},
+				},
+				Failed: nil,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state := &HelmState{
+				ReleaseSetSpec: ReleaseSetSpec{
+					Releases: tt.releases,
+				},
+				logger:         logger,
+				valsRuntime:    valsRuntime,
+				RenderedValues: map[string]any{},
+			}
+			helm := &exectest.Helm{
+				Lists: map[exectest.ListKey]string{},
+			}
+			//simulate the release is already installed
+			for i, release := range tt.releases {
+				if tt.installed != nil && tt.installed[i] {
+					helm.Lists[exectest.ListKey{Filter: "^" + release.Name + "$", Flags: "--uninstalling --deployed --failed --pending"}] = release.Name
+				}
+			}
+
+			affectedReleases := AffectedReleases{}
+			if err := state.SyncReleases(&affectedReleases, helm, []string{}, 1); err != nil {
+				if !testEq(affectedReleases.Failed, tt.wantAffected.Failed) {
+					t.Errorf("HelmState.SyncReleases() error failed for [%s] = %v, want %v", tt.name, affectedReleases.Failed, tt.wantAffected.Failed)
+				} //else expected error
+			}
+			if !testEq(affectedReleases.Upgraded, tt.wantAffected.Upgraded) {
+				t.Errorf("HelmState.SyncReleases() upgrade failed for [%s] = %v, want %v", tt.name, affectedReleases.Upgraded, tt.wantAffected.Upgraded)
+			}
+			if !testEq(affectedReleases.Reinstalled, tt.wantAffected.Reinstalled) {
+				t.Errorf("HelmState.SyncReleases() reinstalled failed for [%s] = %v, want %v", tt.name, affectedReleases.Reinstalled, tt.wantAffected.Reinstalled)
+			}
+			if !testEq(affectedReleases.Deleted, tt.wantAffected.Deleted) {
+				t.Errorf("HelmState.SyncReleases() deleted failed for [%s] = %v, want %v", tt.name, affectedReleases.Deleted, tt.wantAffected.Deleted)
+			}
+		})
+	}
+}
+
 func testEq(a []*ReleaseSpec, b []*exectest.Release) bool {
 	// If one is nil, the other must also be nil.
 	if (a == nil) != (b == nil) {
@@ -1836,14 +1964,19 @@ func TestHelmState_DiffReleases(t *testing.T) {
 }
 
 func TestHelmState_DiffFlags(t *testing.T) {
+	enable := true
+	disable := false
+
 	tests := []struct {
 		name          string
+		defaults      HelmSpec
 		releases      []ReleaseSpec
 		helm          *exectest.Helm
 		wantDiffFlags []string
 	}{
 		{
-			name: "release with api version and kubeversion",
+			name:     "release with api version and kubeversion",
+			defaults: HelmSpec{},
 			releases: []ReleaseSpec{
 				{
 					Name:        "releaseName",
@@ -1856,7 +1989,8 @@ func TestHelmState_DiffFlags(t *testing.T) {
 			wantDiffFlags: []string{"--api-versions", "helmfile.test/v1", "--api-versions", "helmfile.test/v2", "--kube-version", "1.21"},
 		},
 		{
-			name: "release with kubeversion and plain http which is ignored",
+			name:     "release with kubeversion and plain http which is ignored",
+			defaults: HelmSpec{},
 			releases: []ReleaseSpec{
 				{
 					Name:        "releaseName",
@@ -1868,13 +2002,52 @@ func TestHelmState_DiffFlags(t *testing.T) {
 			helm:          &exectest.Helm{},
 			wantDiffFlags: []string{"--kube-version", "1.21"},
 		},
+		{
+			name:     "release with enable-dns",
+			defaults: HelmSpec{EnableDNS: false},
+			releases: []ReleaseSpec{
+				{
+					Name:      "releaseName",
+					Chart:     "foo",
+					EnableDNS: &enable,
+				},
+			},
+			helm:          &exectest.Helm{},
+			wantDiffFlags: []string{"--enable-dns"},
+		},
+		{
+			name:     "release with disable-dns override",
+			defaults: HelmSpec{EnableDNS: true},
+			releases: []ReleaseSpec{
+				{
+					Name:      "releaseName",
+					Chart:     "foo",
+					EnableDNS: &disable,
+				},
+			},
+			helm:          &exectest.Helm{},
+			wantDiffFlags: nil,
+		},
+		{
+			name:     "release with enable-dns from default",
+			defaults: HelmSpec{EnableDNS: true},
+			releases: []ReleaseSpec{
+				{
+					Name:  "releaseName",
+					Chart: "foo",
+				},
+			},
+			helm:          &exectest.Helm{},
+			wantDiffFlags: []string{"--enable-dns"},
+		},
 	}
 	for i := range tests {
 		tt := tests[i]
 		t.Run(tt.name, func(t *testing.T) {
 			state := &HelmState{
 				ReleaseSetSpec: ReleaseSetSpec{
-					Releases: tt.releases,
+					Releases:     tt.releases,
+					HelmDefaults: tt.defaults,
 				},
 				logger:         logger,
 				valsRuntime:    valsRuntime,
@@ -4569,5 +4742,60 @@ func TestPrepareSyncReleases_ValueControlReleaseOverride(t *testing.T) {
 		r := results[0]
 
 		require.Equal(t, tt.flags, r.flags, "Wrong value control flag for release %s", r.release.Name)
+	}
+}
+
+func TestChartCacheKey(t *testing.T) {
+	st := &HelmState{}
+
+	// Test case 1: release with version
+	release1 := &ReleaseSpec{
+		Chart:   "stable/nginx",
+		Version: "1.2.3",
+	}
+
+	key1 := st.getChartCacheKey(release1)
+	expected1 := ChartCacheKey{Chart: "stable/nginx", Version: "1.2.3"}
+
+	if key1 != expected1 {
+		t.Errorf("Expected %+v, got %+v", expected1, key1)
+	}
+
+	// Test case 2: release without version
+	release2 := &ReleaseSpec{
+		Chart: "stable/nginx",
+	}
+
+	key2 := st.getChartCacheKey(release2)
+	expected2 := ChartCacheKey{Chart: "stable/nginx", Version: ""}
+
+	if key2 != expected2 {
+		t.Errorf("Expected %+v, got %+v", expected2, key2)
+	}
+}
+
+func TestChartCache(t *testing.T) {
+	st := &HelmState{}
+
+	// Create a test key
+	key := ChartCacheKey{Chart: "stable/test", Version: "1.0.0"}
+	path := "/tmp/test-chart"
+
+	// Initially, chart should not be in cache
+	_, exists := st.checkChartCache(key)
+	if exists {
+		t.Error("Chart should not be in cache initially")
+	}
+
+	// Add to cache
+	st.addToChartCache(key, path)
+
+	// Now chart should be in cache
+	cachedPath, exists := st.checkChartCache(key)
+	if !exists {
+		t.Error("Chart should be in cache after adding")
+	}
+	if cachedPath != path {
+		t.Errorf("Expected path %s, got %s", path, cachedPath)
 	}
 }
