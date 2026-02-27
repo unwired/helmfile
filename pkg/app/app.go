@@ -355,7 +355,7 @@ func (a *App) Unittest(c UnittestConfigProvider) error {
 		var unittestErrs []error
 
 		// helm unittest needs local charts, so force download
-		prepErr := run.withPreparedCharts("unittest", state.ChartPrepareOptions{
+		prepErr := run.WithPreparedCharts("unittest", state.ChartPrepareOptions{
 			ForceDownload:          true,
 			SkipRepos:              c.SkipRefresh() || c.SkipDeps(),
 			SkipRefresh:            c.SkipRefresh(),
@@ -392,14 +392,14 @@ func (a *App) Unittest(c UnittestConfigProvider) error {
 func (a *App) Fetch(c FetchConfigProvider) error {
 	return a.ForEachState(func(run *Run) (ok bool, errs []error) {
 		prepErr := run.WithPreparedCharts("pull", state.ChartPrepareOptions{
-			ForceDownload:     true,
-			SkipRefresh:       c.SkipRefresh(),
+			ForceDownload:      true,
+			SkipRefresh:        c.SkipRefresh(),
 			AllowPartialErrors: c.AllowPartialErrors(),
-			SkipRepos:         c.SkipRefresh() || c.SkipDeps(),
-			SkipDeps:          c.SkipDeps(),
-			OutputDir:         c.OutputDir(),
-			OutputDirTemplate: c.OutputDirTemplate(),
-			Concurrency:       c.Concurrency(),
+			SkipRepos:          c.SkipRefresh() || c.SkipDeps(),
+			SkipDeps:           c.SkipDeps(),
+			OutputDir:          c.OutputDir(),
+			OutputDirTemplate:  c.OutputDirTemplate(),
+			Concurrency:        c.Concurrency(),
 		}, func() {})
 
 		if prepErr != nil {
