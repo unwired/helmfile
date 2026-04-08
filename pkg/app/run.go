@@ -242,3 +242,7 @@ func (r *Run) diff(triggerCleanupEvent bool, detailedExitCode bool, c DiffConfig
 func (r *Run) GetState() *state.HelmState {
 	return r.state
 }
+
+func (r *Run) GetHelm() helmexec.Interface {
+	return r.helm
+}
